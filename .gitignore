@@ -2,3 +2,4 @@ raw_data
 processed_data
 debugging.ipynb
 .DS_Store
+pairs_temp_*
