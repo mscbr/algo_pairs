@@ -1,7 +1,7 @@
 import numpy as np
 
 
-class MyKalmanFilter:
+class VanillaKalmanFilter:
 
     def __init__(self, delta=1e-4, R=1e-3):
         # measurement noise variance
