@@ -126,7 +126,6 @@ class Coint_Analyzer:
 
     def _get_cointegrated_pairs(self, vanilla_kalman=False):
         df = self.df.copy()
-        keys = df.copy().keys()
         pairs = []
 
         corr_pairs_names = [pair.split("-")
