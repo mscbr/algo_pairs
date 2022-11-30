@@ -1,6 +1,6 @@
 from tools.kalman_filters.py_kalman import KalmanFilterAverage, KalmanFilterRegression
 from tools.kalman_filters.vanilla_kalman import VanillaKalmanFilter
-from statsmodels.tsa.stattools import adfuller, grangercausalitytests, coint
+from statsmodels.tsa.stattools import adfuller, coint
 import numpy as np
 import pandas as pd
 import uuid
@@ -150,43 +150,28 @@ class Coint_Analyzer:
 
                 result_adf = adfuller(spread)
                 if result_adf[1] < 0.01 and result_adf[0] < result_adf[4]["1%"]:
-                    # Granger causality test
-                    # maxlag value should be investigated
-                    # why halflife f() didn't want to work :thinking_face:
-                    try:
-                        g12_pval = grangercausalitytests(df[[inst_1, inst_2]], maxlag=1, verbose=False)[
-                            1][0]['ssr_chi2test'][1]
-                        g21_pval = grangercausalitytests(df[[inst_2, inst_1]], maxlag=1, verbose=False)[
-                            1][0]['ssr_chi2test'][1]
-                    except:
-                        g12_pval = 0
-                        g21_pval = 0
-
                     # is it mean reverting
                     hurst = self._get_hurst_exponent(np.array(spread))
                     if hurst <= 0.5:
+                        index = "%s-%s" % (inst_1, inst_2)
                         pairs.append(
-                            (inst_1, inst_2, result[1], result_adf[0], hurst, g12_pval, g21_pval))
+                            (index, self.corr_pairs.loc[index][0], result_adf[0], hurst))
 
         try:
             indexes = []
+            corr = []
             adf = []
             hurst = []
-            granger_12 = []
-            granger_21 = []
             for row in pairs:
-                indexes.append("%s-%s" % (row[0], row[1]))
-                adf.append(row[3])
-                hurst.append(row[4])
-                granger_12.append(row[5])
-                granger_21.append(row[6])
+                indexes.append(row[0])
+                corr.append(row[1])
+                adf.append(row[2])
+                hurst.append(row[3])
 
             coint_pairs_df = pd.DataFrame(index=indexes)
+            coint_pairs_df['corr'] = corr
             coint_pairs_df['adf'] = adf
             coint_pairs_df['hurst'] = hurst
-            coint_pairs_df['granger_12'] = granger_12
-            coint_pairs_df['granger_21'] = granger_21
-            coint_pairs_df.sort_values(ascending=True, by="adf")
             coint_pairs_df.to_csv("%scoint_pairs_%s_%s.csv" %
                                   (self.processed_data_path, self.interval, self.uuid))
 
