@@ -58,6 +58,9 @@ class Coint_Analyzer:
         if not os.path.exists(self.processed_data_path):
             Path(self.processed_data_path).mkdir(parents=True, exist_ok=True)
 
+    def __repr__(self):
+        return "Closing price cointegration analyzer"
+
     def process_raw_data(self, closing_prices_container_paths=None):
         if closing_prices_container_paths is not None:
             self.closing_prices_container_paths = closing_prices_container_paths
