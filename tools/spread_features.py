@@ -19,13 +19,13 @@ def get_current_df_zscore(series, rolling_window=None):
 
 def half_life(spread):
     spread_lag = spread.shift(1)
-    spread_lag.iloc[0] = spread_lag.iloc[1]
+    spread_lag[0] = spread_lag[1]
     spread_ret = spread - spread_lag
-    spread_ret.iloc[0] = spread_ret.iloc[1]
+    spread_ret[0] = spread_ret[1]
     spread_lag2 = sm.add_constant(spread_lag)
     model = sm.OLS(spread_ret, spread_lag2)
     res = model.fit()
-    halflife = int(round(-np.log(2) / res.params[1], 0))
+    halflife = round(-np.log(2) / res.params[1], 0)
     if halflife <= 1:
         halflife = 1
     return halflife

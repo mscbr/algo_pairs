@@ -56,4 +56,4 @@ class VanillaKalmanFilter:
         hedge_ratio = - state_means[:, 0]
         spread = series1 + (series2 * hedge_ratio)
 
-        return spread
+        return spread, hedge_ratio

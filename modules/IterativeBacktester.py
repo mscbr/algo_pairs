@@ -9,6 +9,7 @@ from tools.kalman_filters.vanilla_kalman import VanillaKalmanFilter
 from tools.metrics import calculate_annualized_mean, calculate_annualized_std, calculate_max_dd
 from tools.spread_features import get_current_df_zscore
 from tools.logging import get_pos_neg_color
+from tools.math_operations import truncate_float
 
 import uuid
 import os
@@ -27,16 +28,23 @@ class IterativeBacktester:
         ticker_interval,
         raw_data_path,
         save_dir_path="../processed_data/",
-        tc=0.0006
+        tc=0.0006,
+        initial_balance=None
     ):
 
         # global settings
         self.pair = pair
-        self.pair_str = "%s-%s" % (pair[0], pair[1])
         self.save_dir_path = save_dir_path
         self.raw_data_path = raw_data_path
         self.ticker_interval = ticker_interval
         self.uuid = str(uuid.uuid4())
+
+        self.initial_balance = initial_balance
+        self.current_balance = initial_balance
+        # {[ticker: string]: units: number}
+        self.assets = {}
+        self.trades = 0
+        self.position = 0
 
         # current backtest settings
         self.tp = None
@@ -84,8 +92,8 @@ class IterativeBacktester:
             df["%s_returns" % instrument] = df[instrument] / \
                 df[instrument].shift(1)
 
-            df["%s_returns_log" % instrument] = np.log(df[instrument] /
-                                                       df[instrument].shift(1))
+            df["%s_logs" % instrument] = np.log(df[instrument] /
+                                                df[instrument].shift(1))
 
             df_closings = pd.concat([df_closings, df], axis=1)
 
@@ -95,16 +103,18 @@ class IterativeBacktester:
         self.tp_year = (
             self.data.shape[0] / ((self.data.index[-1] - self.data.index[0]).days / 365.25))
 
+        # put vanilla variation here + capital charting + "cumsumming" vs. sl/tp
         # wholesample spread for charting purposes
-        state_means = KalmanFilterRegression(
-            df_closings[self.pair[0]], df_closings[self.pair[1]])
+        # state_means = KalmanFilterRegression(
+        #     df_closings[self.pair[0]], df_closings[self.pair[1]])
 
-        hr = - state_means[:, 0]
-        spread = df_closings[self.pair[1]] + (df_closings[self.pair[0]] * hr)
-        self.chart_spread = spread
+        # hr = - state_means[:, 0]
+        # spread = df_closings[self.pair[1]] + (df_closings[self.pair[0]] * hr)
         # test
-        # self.chart_spread = df_closings[self.pair[0]
-        #                                 ] / df_closings[self.pair[1]]
+        mkf = VanillaKalmanFilter(delta=1e-4, R=2)
+        spread, hedge_ratio = mkf.regression(
+            df_closings[self.pair[0]], df_closings[self.pair[1]])
+        self.chart_spread = spread
 
     def optimize_pair(
         self,
@@ -215,7 +225,7 @@ class IterativeBacktester:
         hedge_ratio = - state_means[:, 0]
         spread = series1 + (series2 * hedge_ratio)
 
-        return spread
+        return spread, hedge_ratio
 
     def backtest_pair(
         self,
@@ -224,6 +234,7 @@ class IterativeBacktester:
         z_short_perc=95,
         tp=0.01,
         sl=-0.01,
+        use_raw_spread=False,
         use_pykalman=False,
         avg_kalman=False,
         rolling_z_window=None,
@@ -231,7 +242,8 @@ class IterativeBacktester:
         start_date=None,
         silent=True,
         report_dir="./",
-        charts=False
+        charts=False,
+        initial_balance=None,
     ):
         stationary_spread = True
         self.tp = tp
@@ -249,10 +261,17 @@ class IterativeBacktester:
         returns1 = self.data["%s_returns" % inst1].to_numpy()
         returns2 = self.data["%s_returns" % inst2].to_numpy()
 
+        if initial_balance is not None:
+            self.initial_balance = initial_balance
+            self.current_balance = initial_balance
+            self.assets[inst1] = 0
+            self.assets[inst2] = 0
+
         signals = np.empty((0, 1), dtype="float64")
         inst1_position = np.empty((0, 1), dtype="float64")
         inst2_position = np.empty((0, 1), dtype="float64")
         spread_record = np.empty((0, 1), dtype="float64")
+        hedge_r_record = np.empty((0, 1), dtype="float64")
         zscore = np.empty((0, 1), dtype="float64")
         z_long_record = np.empty((0, 1), dtype="float64")
         z_short_record = np.empty((0, 1), dtype="float64")
@@ -279,22 +298,27 @@ class IterativeBacktester:
             sample_series2 = series2[t-window:t+2]
 
             old_signal = signal
-            old_position1 = position1
-            old_position2 = position2
             gross = 0
             net = 0
 
+            # knowledge note:
+            # because of feeding prices instead of return series
+            # we are getting PRICE SPREAD (vs. return spread)
             if use_pykalman:
-                spread = self.get_Kalman_spread(
+                spread, hedge_ratio = self.get_Kalman_spread(
                     sample_series1, sample_series2, avg_kalman=avg_kalman)
+            elif use_raw_spread:
+                spread = returns1[t-window:t+2] - returns2[t-window:t+2]
+                hedge_ratio = [1]
             else:
                 mkf = VanillaKalmanFilter(delta=1e-4, R=2)
-                spread = mkf.regression(sample_series1, sample_series2)
+                spread, hedge_ratio = mkf.regression(
+                    sample_series1, sample_series2)
 
             # STATIONARY TESTING (ADF 10%)
             if stationarity_testing:
                 adf = adfuller(spread)
-                stationary_spread = adf[0] < adf[4]["10%"]
+                stationary_spread = adf[0] < adf[4]["5%"]
 
             if rolling_z_window:
                 current_z_score, z_score_series = get_current_df_zscore(
@@ -327,18 +351,29 @@ class IterativeBacktester:
 
             # check out what type of index is within the sample & if usage of "window+1" is legit
             gross = position1*returns1[t+1] + position2*returns2[t+1]
-            net = gross - self.tc * \
-                (abs(position1 - old_position1) + abs(position2 - old_position2))
+            fees = self.tc*abs(signal - old_signal)*2
+            net = gross - fees
+
             if signal == old_signal:
                 current_return = (1+current_return)*(1+net)-1
             else:
                 current_return = net
+
+            # CAPITAL
+            if initial_balance is not None:
+                if signal != old_signal:
+                    if signal != 0:
+                        self._buy_pair(inst1, inst2, signal,
+                                       t+1)
+                    elif signal == 0:
+                        self._withdraw_pair(t+1)
 
             inst1_position = np.vstack((inst1_position, [position1]))
             inst2_position = np.vstack((inst2_position, [position2]))
             signals = np.vstack((signals, [signal]))
             spread_record = np.vstack(
                 (spread_record, [spread[-1]]))  # double-check on this
+            hedge_r_record = np.vstack((hedge_r_record, [hedge_ratio[-1]]))
             zscore = np.vstack((zscore, [current_z_score]))
             z_long_record = np.vstack((z_long_record, [z_long]))
             z_short_record = np.vstack((z_short_record, [z_short]))
@@ -366,7 +401,12 @@ class IterativeBacktester:
                     current_return), str(round(current_return, 3)) + '% ',
                 "\033%sPOS:" % get_pos_neg_color(signal), signal
             )
+            if initial_balance is not None:
+                print("Current Balance: {}".format(
+                    round(self.current_balance, 2)))
 
+        if initial_balance is not None:
+            self._withdraw_pair(len(self.data)-1)
         gross_cum = np.reshape(np.cumprod(1+gross_returns), (-1, 1))
         net_cum = np.reshape(np.cumprod(1+net_returns), (-1, 1))
 
@@ -375,6 +415,7 @@ class IterativeBacktester:
             inst2_position,
             signals,
             spread_record,
+            hedge_r_record,
             zscore,
             z_long_record,
             z_short_record,
@@ -385,7 +426,7 @@ class IterativeBacktester:
         ), axis=1)
 
         df = pd.DataFrame(output, columns=[
-            "%s_position" % inst1, "%s_position" % inst2, "signals", "spread",
+            "%s_position" % inst1, "%s_position" % inst2, "signals", "spread", "hedge_ratio",
             "zscore", "z_long", "z_short", "gross_returns",
             "net_returns", "gross_cum", "net_cum"], index=self.data.index.copy()[self.iter_start+1:])
 
@@ -405,6 +446,122 @@ class IterativeBacktester:
                 save_dir_path=save_dir_path, silent=silent)
         self._get_backtest_report(save_dir_path=save_dir_path, silent=silent)
         self._save_result_to_file(save_dir_path=save_dir_path)
+
+    def _buy_pair(self, instrument1, instrument2, signal, t):
+        # if self.capital <= 0:
+        #     print("No capital to use")
+        #     return
+
+        # capital_per_asset = self.capital/2
+        positions = [-signal, signal]
+        amount = self.current_balance/2
+        for i, instrument in enumerate([instrument1, instrument2]):
+            if positions[i] > 0:
+                self._go_long(instrument, t, amount)
+            if positions[i] < 0:
+                self._go_short(instrument, t, amount)
+            # price = self.data[instrument].iloc[t]
+            # amount = truncate_float(capital_per_asset/price, 4)
+            # self.assets.append({
+            #     'name': instrument,
+            #     'amount': amount,
+            #     'price': price,
+            #     'side': positions[i]
+            # })
+            # self.capital -= (amount*price)
+
+    def _withdraw_pair(self, t):
+        for ticker in self.assets:
+            if self.assets[ticker] > 0:
+                self._sell_instrument(ticker, t, units=self.assets[ticker])
+            if self.assets[ticker] < 0:
+                self._buy_instrument(ticker, t, units=-self.assets[ticker])
+            # self._close_pos(asset, t)
+            # new_price = self.data[asset['name']].iloc[t]
+            # if asset['side'] == 1:
+            #     self.capital += (asset['amount'] * new_price)
+            # if asset['side'] == -1:
+            #     initial_capital = asset['amount'] * asset['price']
+            #     self.capital += initial_capital + \
+            #         (initial_capital - asset['amount'] * new_price)
+
+        # self.assets = {}
+
+    # helper method
+    def _go_long(self, ticker, bar, units=None, amount=None):
+        if self.assets[ticker] < 0:
+            # if short position, go neutral first
+            self._buy_instrument(ticker, bar, units=-self.assets[ticker])
+        if units:
+            self._buy_instrument(ticker, bar, units=units)
+        elif amount:
+            if amount == "all":
+                amount = self.current_balance/2
+            self._buy_instrument(ticker, bar, amount=amount)  # go long
+
+    # helper method
+    def _go_short(self, ticker, bar, units=None, amount=None):
+        if self.assets[ticker] > 0:
+            # if long position, go neutral first
+            self._sell_instrument(ticker, bar, units=self.assets[ticker])
+        if units:
+            self._sell_instrument(ticker, bar, units=units)
+        elif amount:
+            if amount == "all":
+                amount = self.current_balance/2
+            self._sell_instrument(ticker, bar, amount=amount)  # go short
+
+    def _buy_instrument(self, ticker, bar, units=None, amount=None):
+        ''' Places and executes a buy order (market order).
+        '''
+        date, price = self._get_values(ticker, bar)
+        if amount is not None:  # use units if units are passed, otherwise calculate units
+            units = truncate_float(amount/price, 4)
+        self.current_balance -= units * price  # reduce cash balance by "purchase price"
+        self.assets[ticker] += units
+        self.trades += 1
+        print("{} |  Buying {} for {}".format(date, units, round(price, 5)))
+
+    def _sell_instrument(self, ticker, bar, units=None, amount=None):
+        ''' Places and executes a sell order (market order).
+        '''
+        date, price = self._get_values(ticker, bar)
+        if amount is not None:  # use units if units are passed, otherwise calculate units
+            units = truncate_float(amount/price, 4)
+        # increases cash balance by "purchase price"
+        self.current_balance += units * price
+        self.assets[ticker] -= units
+        self.trades += 1
+        print("{} |  Selling {} for {}".format(date, units, round(price, 5)))
+
+    def _get_values(self, ticker, bar):
+        ''' Returns the date, the price and the spread for the given bar.
+        '''
+        date = str(self.data.index[bar].date())
+        price = round(self.data.iloc[bar].loc[ticker], 5)
+        return date, price
+
+    def _close_pos(self, ticker, bar):
+        ''' Closes out a long or short position (go neutral).
+        '''
+        for ticker in self.assets.keys():
+            date, price = self._get_values(ticker, bar)
+            print(75 * "-")
+            print("{} | +++ CLOSING FINAL POSITION FOR {}+++".format(date, ticker))
+            # closing final position (works with short and long!)
+            self.current_balance += self.assets[ticker] * price
+            # substract half-spread costs
+            print("{} | closing position of {} for {}".format(
+                date, self.assets[ticker], price))
+            self.assets[ticker] = 0  # setting position to neutral
+            self.trades += 1
+        # self.current_balance -= self.trades*self.tc
+        # perf = (self.current_balance - self.initial_balance) / \
+        #     self.initial_balance * 100
+        # self.print_current_balance(bar)
+        # print("{} | net performance (%) = {}".format(date, round(perf, 2)))
+        # print("{} | number of trades executed = {}".format(date, self.trades))
+        # print(75 * "-")
 
     def _get_backtest_report(self, save_dir_path=None, silent=False):
         # add winning positions amount & loosing positions amount

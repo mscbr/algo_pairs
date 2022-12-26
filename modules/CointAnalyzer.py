@@ -1,8 +1,10 @@
 from tools.kalman_filters.py_kalman import KalmanFilterAverage, KalmanFilterRegression
 from tools.kalman_filters.vanilla_kalman import VanillaKalmanFilter
+from tools.spread_features import half_life
 from statsmodels.tsa.stattools import adfuller, coint
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 import uuid
 import os
 import sys
@@ -92,13 +94,20 @@ class Coint_Analyzer:
         else:
             self.df = df_closings.dropna()
 
-    def generate_co_matrices(self, generate_excel=False, vanilla_kalman=False, create_cache=False):
+    def generate_co_matrices(
+        self,
+        generate_excel=False,
+        vanilla_kalman=False,
+        create_cache=False,
+        save_spreads=False,
+        raw_spread=False,
+    ):
         # CORRELATION
         self._get_correlated_pairs(
             generate_excel=generate_excel, corr_filter=self.corr_filter)
         # COINTEGRATION
         self._get_cointegrated_pairs(
-            vanilla_kalman=vanilla_kalman, create_cache=create_cache)
+            vanilla_kalman=vanilla_kalman, raw_spread=raw_spread, create_cache=create_cache, save_spreads=save_spreads)
 
     def _get_correlated_pairs(self, generate_excel=False, corr_filter=None):
         corr_matrix = self.df.pct_change().corr(method='pearson')
@@ -130,9 +139,21 @@ class Coint_Analyzer:
         except:
             print("Couldn't save correlated pairs to files")
 
-    def _get_cointegrated_pairs(self, vanilla_kalman=False, create_cache=False):
+    def _get_cointegrated_pairs(
+        self,
+        vanilla_kalman=False,
+        raw_spread=False,
+        create_cache=False,
+        save_spreads=False
+    ):
         cache = None
         cache_result = None
+
+        if save_spreads:
+            save_spreads_dir = "%scoint_pairs_%s_%s/" % (
+                self.processed_data_path, self.interval, self.uuid)
+            Path(save_spreads_dir).mkdir(parents=True, exist_ok=True)
+
         df = self.df.copy()
 
         pairs = []
@@ -146,7 +167,8 @@ class Coint_Analyzer:
                                      'analyzed': [False],
                                      'corr': [np.nan],
                                      'adf': [np.nan],
-                                     'hurst': [np.nan]
+                                     'hurst': [np.nan],
+                                     'half_life': [np.nan],
             })
             cache_path = ("%scoint_anal_cache_%s_%s.csv" %
                           (self.processed_data_path, self.interval, self.uuid))
@@ -162,37 +184,61 @@ class Coint_Analyzer:
                                 for pair in pairs_to_analyze]
 
         # RUNNING ANALYSIS
+        print("STARTING ANALYSIS")
         for i, corr_pair in enumerate(corr_pairs_names):
             print("Performing coint test %s %s" % (i, len(corr_pairs_names)))
             inst_1 = corr_pair[0]
             inst_2 = corr_pair[1]
             result = coint(df[inst_1], df[inst_2])
             if cache is not None:
-                cache_result = [np.nan, np.nan, np.nan]
+                cache_result = [np.nan, np.nan, np.nan, np.nan]
 
             # testing for spread stationarity
             if result[1] < 0.05:
                 if vanilla_kalman:
                     mkf = VanillaKalmanFilter(delta=1e-4, R=2)
-                    spread = mkf.regression(df[inst_1], df[inst_2])
+                    spread, hedge_ratio = mkf.regression(
+                        df[inst_1], df[inst_2])
+                elif raw_spread:
+                    spread = df[inst_1] - ((df[inst_1]/df[inst_2]*df[inst_2]))
                 else:
                     # more variations could be implemented
-                    state_means = KalmanFilterRegression(KalmanFilterAverage(
-                        df[inst_1]), KalmanFilterAverage(df[inst_2]))
+                    state_means = KalmanFilterRegression(
+                        df[inst_1], df[inst_2])
                     hedge_ratio = - state_means[:, 0]
                     spread = df[inst_2] + (df[inst_1] * hedge_ratio)
 
                 result_adf = adfuller(spread)
-                if result_adf[1] < 0.01 and result_adf[0] < result_adf[4]["1%"]:
+                if result_adf[1] < 0.01 and result_adf[0] < result_adf[4]["10%"]:
                     # is it mean reverting
                     hurst = self._get_hurst_exponent(np.array(spread))
                     if hurst <= 0.5:
+                        print("hurst", hurst)
                         index = "%s-%s" % (inst_1, inst_2)
+                        half_life_value = 1  # half_life(spread)
+                        print("half_life", half_life_value)
                         pairs.append(
-                            (index, self.corr_pairs.loc[index][0], result_adf[0], hurst))
+                            (index, self.corr_pairs.loc[index][0], result_adf[0], hurst, half_life_value))
+                        if save_spreads is not None:
+                            print("SAVING SPREAD")
+                            df_spread = df[[inst_1, inst_2]].copy()
+                            df_spread.loc[:, 'spread'] = spread
+                            try:
+                                df_spread.to_csv(
+                                    "%s%s_%s_spread.csv" % (save_spreads_dir, inst_1, inst_2))
+                                df_spread["spread"].plot(figsize=(12, 8))
+                                plt.grid()
+                                plt.rcParams['figure.facecolor'] = 'lavender'
+                                plt.savefig("%s%s_%s_spread.png" %
+                                            (save_spreads_dir, inst_1, inst_2))
+                                plt.clf()
+                            except:
+                                print("Couldn't save spread for %s_%s" %
+                                      (inst_1, inst_2))
                         if cache is not None:
                             cache_result = [
-                                self.corr_pairs.loc[index][0], result_adf[0], hurst]
+                                self.corr_pairs.loc[index][0],
+                                result_adf[0], hurst, half_life_value]
             # UPDATING CACHE
             if cache is not None:
                 try:
@@ -209,11 +255,13 @@ class Coint_Analyzer:
             corr = []
             adf = []
             hurst = []
+            half_life_values = []
             for column in pairs:
                 indexes.append(column[0])
                 corr.append(column[1])
                 adf.append(column[2])
                 hurst.append(column[3])
+                half_life_values.append(column[4])
 
             # ADDING CACHED RESULTS
             if cache is not None:
@@ -225,6 +273,7 @@ class Coint_Analyzer:
                         corr.append(column[1])
                         adf.append(column[2])
                         hurst.append(column[3])
+                        half_life_values.append(column[4])
 
             coint_pairs_df = pd.DataFrame(index=indexes)
             coint_pairs_df['corr'] = corr
@@ -255,7 +304,7 @@ class Coint_Analyzer:
         lags = range(2, 20)
         # Calculate the array of the variances of the lagged differences
         tau = [np.sqrt(np.std(np.subtract(time_series[lag:],
-                       time_series[:-lag]))) for lag in lags]
+                                          time_series[:-lag]))) for lag in lags]
         # Use a linear fit to estimate the Hurst Exponent
         poly = np.polyfit(np.log(lags), np.log(tau), 1)
         # Return the Hurst exponent from the polyfit output
