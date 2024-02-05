@@ -277,6 +277,7 @@ class IterativeBacktester:
         z_short_record = np.empty((0, 1), dtype="float64")
         gross_returns = np.empty((0, 1), dtype="float64")
         net_returns = np.empty((0, 1), dtype="float64")
+        current_balance = np.empty((0, 1), dtype="float64")
 
         signal = 0
         old_signal = 0
@@ -363,8 +364,8 @@ class IterativeBacktester:
             if initial_balance is not None:
                 if signal != old_signal:
                     if signal != 0:
-                        self._buy_pair(inst1, inst2, signal,
-                                       t+1)
+                        self._hedge_pair(inst1, inst2, signal,
+                                         t+1)
                     elif signal == 0:
                         self._withdraw_pair(t+1)
 
@@ -379,6 +380,8 @@ class IterativeBacktester:
             z_short_record = np.vstack((z_short_record, [z_short]))
             gross_returns = np.vstack((gross_returns, [gross]))
             net_returns = np.vstack((net_returns, [net]))
+            current_balance = np.vstack(
+                (current_balance, [self.current_balance]))
 
             # interface: reporting daily positions and realised returns
             if silent is True:
@@ -423,12 +426,13 @@ class IterativeBacktester:
             net_returns,
             gross_cum,
             net_cum,
+            current_balance
         ), axis=1)
 
         df = pd.DataFrame(output, columns=[
             "%s_position" % inst1, "%s_position" % inst2, "signals", "spread", "hedge_ratio",
             "zscore", "z_long", "z_short", "gross_returns",
-            "net_returns", "gross_cum", "net_cum"], index=self.data.index.copy()[self.iter_start+1:])
+            "net_returns", "gross_cum", "net_cum", "curr_balance"], index=self.data.index.copy()[self.iter_start+1:])
 
         self.result = df
 
@@ -447,7 +451,7 @@ class IterativeBacktester:
         self._get_backtest_report(save_dir_path=save_dir_path, silent=silent)
         self._save_result_to_file(save_dir_path=save_dir_path)
 
-    def _buy_pair(self, instrument1, instrument2, signal, t):
+    def _hedge_pair(self, instrument1, instrument2, signal, t):
         # if self.capital <= 0:
         #     print("No capital to use")
         #     return
@@ -457,18 +461,9 @@ class IterativeBacktester:
         amount = self.current_balance/2
         for i, instrument in enumerate([instrument1, instrument2]):
             if positions[i] > 0:
-                self._go_long(instrument, t, amount)
+                self._go_long(instrument, t, None, amount)
             if positions[i] < 0:
-                self._go_short(instrument, t, amount)
-            # price = self.data[instrument].iloc[t]
-            # amount = truncate_float(capital_per_asset/price, 4)
-            # self.assets.append({
-            #     'name': instrument,
-            #     'amount': amount,
-            #     'price': price,
-            #     'side': positions[i]
-            # })
-            # self.capital -= (amount*price)
+                self._go_short(instrument, t, None, amount)
 
     def _withdraw_pair(self, t):
         for ticker in self.assets:
@@ -476,16 +471,6 @@ class IterativeBacktester:
                 self._sell_instrument(ticker, t, units=self.assets[ticker])
             if self.assets[ticker] < 0:
                 self._buy_instrument(ticker, t, units=-self.assets[ticker])
-            # self._close_pos(asset, t)
-            # new_price = self.data[asset['name']].iloc[t]
-            # if asset['side'] == 1:
-            #     self.capital += (asset['amount'] * new_price)
-            # if asset['side'] == -1:
-            #     initial_capital = asset['amount'] * asset['price']
-            #     self.capital += initial_capital + \
-            #         (initial_capital - asset['amount'] * new_price)
-
-        # self.assets = {}
 
     # helper method
     def _go_long(self, ticker, bar, units=None, amount=None):
@@ -496,8 +481,8 @@ class IterativeBacktester:
             self._buy_instrument(ticker, bar, units=units)
         elif amount:
             if amount == "all":
-                amount = self.current_balance/2
-            self._buy_instrument(ticker, bar, amount=amount)  # go long
+                amount = self.current_balance
+            self._buy_instrument(ticker, bar, None, amount=amount)  # go long
 
     # helper method
     def _go_short(self, ticker, bar, units=None, amount=None):
@@ -508,8 +493,8 @@ class IterativeBacktester:
             self._sell_instrument(ticker, bar, units=units)
         elif amount:
             if amount == "all":
-                amount = self.current_balance/2
-            self._sell_instrument(ticker, bar, amount=amount)  # go short
+                amount = self.current_balance
+            self._sell_instrument(ticker, bar, None, amount=amount)  # go short
 
     def _buy_instrument(self, ticker, bar, units=None, amount=None):
         ''' Places and executes a buy order (market order).
@@ -540,28 +525,6 @@ class IterativeBacktester:
         date = str(self.data.index[bar].date())
         price = round(self.data.iloc[bar].loc[ticker], 5)
         return date, price
-
-    def _close_pos(self, ticker, bar):
-        ''' Closes out a long or short position (go neutral).
-        '''
-        for ticker in self.assets.keys():
-            date, price = self._get_values(ticker, bar)
-            print(75 * "-")
-            print("{} | +++ CLOSING FINAL POSITION FOR {}+++".format(date, ticker))
-            # closing final position (works with short and long!)
-            self.current_balance += self.assets[ticker] * price
-            # substract half-spread costs
-            print("{} | closing position of {} for {}".format(
-                date, self.assets[ticker], price))
-            self.assets[ticker] = 0  # setting position to neutral
-            self.trades += 1
-        # self.current_balance -= self.trades*self.tc
-        # perf = (self.current_balance - self.initial_balance) / \
-        #     self.initial_balance * 100
-        # self.print_current_balance(bar)
-        # print("{} | net performance (%) = {}".format(date, round(perf, 2)))
-        # print("{} | number of trades executed = {}".format(date, self.trades))
-        # print(75 * "-")
 
     def _get_backtest_report(self, save_dir_path=None, silent=False):
         # add winning positions amount & loosing positions amount
@@ -662,6 +625,7 @@ class IterativeBacktester:
 
         axs[0].plot(result["net_cum"], color="blue", label="NET")
         axs[0].plot(result["gross_cum"], color="orange", label="GROSS")
+        axs[0].plot(result["curr_balance"]/self.initial_balance, color="green", label="CASH_BALANCE")
         axs[0].grid()
         axs[0].legend()
         axs[0].set_xlabel("PNL | NET: {}% | GROSS: {}%".format(
