@@ -11,3 +11,4 @@ corr_matrix_temp.xlsx
 corr_pairs_temp.xlsx
 .history/
 *.pyc
+code_bin/*

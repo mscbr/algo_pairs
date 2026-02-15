@@ -10,7 +10,7 @@ class VanillaKalmanFilter:
         # co-variance of process noise(2 dimensions)
         self.Q = delta / (1-delta) * np.eye(2)
 
-        # state (slope, intercept) will be (2 x n), we will initialize with just one column at first
+        # current state (slope, intercept) — 2x1 column vector
         self.x = np.zeros((2, 1))
 
         # state covariance
@@ -24,7 +24,7 @@ class VanillaKalmanFilter:
 
         ## TIME UPDATE ##
         # first thing is to predict new state as the previous one (2x1)
-        x_hat = self.x[:, -1][..., None]
+        x_hat = self.x
 
         # then, the uncertainty or covariance prediction
         P_hat = self.P + self.Q
@@ -41,17 +41,19 @@ class VanillaKalmanFilter:
         # uncertainty update
         self.P = (np.eye(2)-K.dot(H)).dot(P_hat)
 
-        # append the new state to the vector
-        self.x = np.concatenate([self.x, x], axis=1)
+        # store current state only
+        self.x = x
 
         return x
 
     def regression(self, series1, series2):
-        state_means = np.zeros((0, 2), dtype="float64")
+        n = series1.shape[0]
+        state_means = np.empty((n, 2), dtype="float64")
 
-        for t in range(0, series1.shape[0]):
+        for t in range(n):
             x = self.step_forward(series1[t], series2[t])
-            state_means = np.vstack((state_means, [x[0][0], x[1][0]]))
+            state_means[t, 0] = x[0, 0]
+            state_means[t, 1] = x[1, 0]
 
         hedge_ratio = - state_means[:, 0]
         spread = series1 + (series2 * hedge_ratio)

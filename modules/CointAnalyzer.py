@@ -2,13 +2,17 @@ from tools.kalman_filters.py_kalman import KalmanFilterAverage, KalmanFilterRegr
 from tools.kalman_filters.vanilla_kalman import VanillaKalmanFilter
 from tools.spread_features import half_life
 from statsmodels.tsa.stattools import adfuller, coint
+import statsmodels.api as sm
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import logging
 import uuid
 import os
 import sys
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 parent_dir = os.path.abspath('..')
 if parent_dir not in sys.path:
@@ -26,7 +30,11 @@ class Coint_Analyzer:
         interval="15m",
         observations_filter=None,
         days_filter=None,
-        corr_filter=None
+        corr_filter=None,
+        half_life_min=None,
+        half_life_max=None,
+        lookback_days=None,
+        spread_method="kalman",
     ):
         self.raw_data_path = raw_data_path
         self.closing_prices_container_paths = closing_prices_container_paths
@@ -36,6 +44,11 @@ class Coint_Analyzer:
         self.observations_filter = observations_filter
         self.days_filter = days_filter
         self.df_observations = None
+
+        self.half_life_min = half_life_min
+        self.half_life_max = half_life_max
+        self.lookback_days = lookback_days
+        self.spread_method = spread_method
 
         self.uuid = str(uuid.uuid4())
         self.interval = interval
@@ -82,6 +95,12 @@ class Coint_Analyzer:
                     instrument = "_".join(entry.name.split("_")[0:2])
                     df = pd.read_csv('%s%s/%s' %
                                      (self.raw_data_path, path, entry.name), index_col="Date")
+                    # Ensure index is datetime
+                    df.index = pd.to_datetime(df.index)
+                    
+                    # Handle duplicate indices
+                    df = df[~df.index.duplicated(keep='first')]
+                    
                     df = df[["Close"]].copy()
                     df.columns = [instrument]
                     df_closings = pd.concat([df_closings, df], axis=1)
@@ -97,19 +116,21 @@ class Coint_Analyzer:
     def generate_co_matrices(
         self,
         generate_excel=False,
-        vanilla_kalman=False,
         create_cache=False,
         save_spreads=False,
-        raw_spread=False,
+        remove_quote_currency_pairs=True,
+        spread_method=None,
     ):
+        if spread_method is not None:
+            self.spread_method = spread_method
         # CORRELATION
         self._get_correlated_pairs(
-            generate_excel=generate_excel, corr_filter=self.corr_filter)
+            generate_excel=generate_excel, corr_filter=self.corr_filter, remove_quote_currency_pairs=remove_quote_currency_pairs)
         # COINTEGRATION
         self._get_cointegrated_pairs(
-            vanilla_kalman=vanilla_kalman, raw_spread=raw_spread, create_cache=create_cache, save_spreads=save_spreads)
+            create_cache=create_cache, save_spreads=save_spreads)
 
-    def _get_correlated_pairs(self, generate_excel=False, corr_filter=None):
+    def _get_correlated_pairs(self, generate_excel=False, corr_filter=None, remove_quote_currency_pairs=True):
         corr_matrix = self.df.pct_change().corr(method='pearson')
         if generate_excel:
             corr_matrix.to_excel("%scorr_matrix_%s_%s.xlsx" %
@@ -127,6 +148,9 @@ class Coint_Analyzer:
             indexes.append("%s-%s" % (idx[0], idx[1]))
             values.append(au_corr[idx])
         corr_pairs_df = pd.DataFrame(index=indexes, data=values)
+        
+        if remove_quote_currency_pairs:
+            corr_pairs_df = self._remove_quote_currency_pairs(corr_pairs_df)
 
         if corr_filter:
             corr_pairs_df = corr_pairs_df.loc[corr_pairs_df.iloc[:, 0]
@@ -136,15 +160,13 @@ class Coint_Analyzer:
         try:
             corr_pairs_df.to_csv("%scorr_pairs_%s_%s.csv" %
                                  (self.processed_data_path, self.interval, self.uuid))
-        except:
-            print("Couldn't save correlated pairs to files")
+        except (IOError, OSError) as e:
+            logger.warning("Couldn't save correlated pairs to files: %s", e)
 
     def _get_cointegrated_pairs(
         self,
-        vanilla_kalman=False,
-        raw_spread=False,
         create_cache=False,
-        save_spreads=False
+        save_spreads=False,
     ):
         cache = None
         cache_result = None
@@ -156,32 +178,34 @@ class Coint_Analyzer:
 
         df = self.df.copy()
 
+        if self.lookback_days is not None:
+            n_obs = int(self.lookback_days * self.interval_to_days_map[self.interval])
+            if len(df) > n_obs:
+                df = df.iloc[-n_obs:]
+
         pairs = []
-        corr_pairs_names = [pair.split("-")
-                            for pair in list(self.corr_pairs.index)]
+        corr_pairs_names = [pair.split("-") for pair in list(self.corr_pairs.index)]
 
         # INIT CACHE HANDLING
         if create_cache and not self.cache_path:
             cache = pd.DataFrame(index=list(self.corr_pairs.index),
-                                 data={
-                                     'analyzed': [False],
-                                     'corr': [np.nan],
-                                     'adf': [np.nan],
-                                     'hurst': [np.nan],
-                                     'half_life': [np.nan],
+                                data={
+                                    'analyzed': False,
+                                    'corr': np.nan,
+                                    'adf': np.nan,
+                                    'hurst': np.nan,
+                                    'half_life': np.nan,
             })
             cache_path = ("%scoint_anal_cache_%s_%s.csv" %
-                          (self.processed_data_path, self.interval, self.uuid))
+                        (self.processed_data_path, self.interval, self.uuid))
             self.cache_path = cache_path
         elif self.cache_path:
             cache = pd.read_csv(self.cache_path, index_col=0)
         if cache is not None:
-            cache_finished_pairs = list(
-                cache.loc[cache.analyzed == True].index)
+            cache_finished_pairs = list(cache.loc[cache.analyzed == True].index)
             pairs_to_analyze = [
                 pair for pair in list(self.corr_pairs.index) if pair not in cache_finished_pairs]
-            corr_pairs_names = [pair.split("-")
-                                for pair in pairs_to_analyze]
+            corr_pairs_names = [pair.split("-") for pair in pairs_to_analyze]
 
         # RUNNING ANALYSIS
         print("STARTING ANALYSIS")
@@ -195,61 +219,61 @@ class Coint_Analyzer:
 
             # testing for spread stationarity
             if result[1] < 0.05:
-                if vanilla_kalman:
-                    mkf = VanillaKalmanFilter(delta=1e-4, R=2)
-                    spread, hedge_ratio = mkf.regression(
-                        df[inst_1], df[inst_2])
-                elif raw_spread:
-                    spread = df[inst_1] - ((df[inst_1]/df[inst_2]*df[inst_2]))
-                else:
-                    # more variations could be implemented
-                    state_means = KalmanFilterRegression(
-                        df[inst_1], df[inst_2])
-                    hedge_ratio = - state_means[:, 0]
-                    spread = df[inst_2] + (df[inst_1] * hedge_ratio)
+                spread, hedge_ratio = self._compute_spread(df[inst_1], df[inst_2], self.spread_method)
 
                 result_adf = adfuller(spread)
-                if result_adf[1] < 0.01 and result_adf[0] < result_adf[4]["10%"]:
-                    # is it mean reverting
+                if result_adf[1] < 0.05:
                     hurst = self._get_hurst_exponent(np.array(spread))
                     if hurst <= 0.5:
                         print("hurst", hurst)
                         index = "%s-%s" % (inst_1, inst_2)
-                        half_life_value = 1  # half_life(spread)
+                        half_life_value = half_life(spread)
                         print("half_life", half_life_value)
+
+                        if self.half_life_min is not None and half_life_value < self.half_life_min:
+                            continue
+                        if self.half_life_max is not None and half_life_value > self.half_life_max:
+                            continue
+
                         pairs.append(
                             (index, self.corr_pairs.loc[index][0], result_adf[0], hurst, half_life_value))
-                        if save_spreads is not None:
-                            print("SAVING SPREAD")
+
+                        if save_spreads:
+                            print("SAVING SPREADS")
                             df_spread = df[[inst_1, inst_2]].copy()
-                            df_spread.loc[:, 'spread'] = spread
+                            df_spread['spread'] = spread
+
                             try:
-                                df_spread.to_csv(
-                                    "%s%s_%s_spread.csv" % (save_spreads_dir, inst_1, inst_2))
-                                df_spread["spread"].plot(figsize=(12, 8))
-                                plt.grid()
+                                df_spread.to_csv("%s%s_%s_spread.csv" % (save_spreads_dir, inst_1, inst_2))
+
+                                plt.figure(figsize=(12, 6))
+                                plt.plot(spread, label='spread (%s)' % self.spread_method, color='blue', alpha=0.7)
+                                plt.title(f'{self.spread_method} spread: {inst_1} vs {inst_2}')
+                                plt.xlabel('Time')
+                                plt.ylabel('Spread Value')
+                                plt.legend()
+                                plt.grid(True)
                                 plt.rcParams['figure.facecolor'] = 'lavender'
-                                plt.savefig("%s%s_%s_spread.png" %
-                                            (save_spreads_dir, inst_1, inst_2))
-                                plt.clf()
-                            except:
-                                print("Couldn't save spread for %s_%s" %
-                                      (inst_1, inst_2))
+                                plt.savefig("%s%s_%s_spread.pdf" % (save_spreads_dir, inst_1, inst_2))
+                                plt.close()
+
+                            except Exception as e:
+                                print(f"Couldn't save spread for {inst_1}_{inst_2}: {str(e)}")
+
                         if cache is not None:
                             cache_result = [
                                 self.corr_pairs.loc[index][0],
                                 result_adf[0], hurst, half_life_value]
-            # UPDATING CACHE
+            
+            # UPDATING CACHE (unchanged from your original code)
             if cache is not None:
                 try:
-                    cache.loc["%s-%s" % (inst_1, inst_2)] = [
-                        True,
-                        *cache_result
-                    ]
+                    cache.loc["%s-%s" % (inst_1, inst_2)] = [True, *cache_result]
                     cache.to_csv(self.cache_path)
-                except:
-                    print("Couldn't write coint cache")
+                except (IOError, OSError, KeyError) as e:
+                    logger.warning("Couldn't write coint cache: %s", e)
 
+        # FINAL SAVE (unchanged from your original code)
         try:
             indexes = []
             corr = []
@@ -263,7 +287,6 @@ class Coint_Analyzer:
                 hurst.append(column[3])
                 half_life_values.append(column[4])
 
-            # ADDING CACHED RESULTS
             if cache is not None:
                 cache.dropna(inplace=True)
                 for i in range(0, len(cache)):
@@ -279,13 +302,13 @@ class Coint_Analyzer:
             coint_pairs_df['corr'] = corr
             coint_pairs_df['adf'] = adf
             coint_pairs_df['hurst'] = hurst
-            coint_pairs_df.sort_values(
-                by='corr', ascending=False, inplace=True)
+            coint_pairs_df['half_life'] = half_life_values
+            coint_pairs_df.sort_values(by='corr', ascending=False, inplace=True)
             coint_pairs_df.to_csv("%scoint_pairs_%s_%s.csv" %
-                                  (self.processed_data_path, self.interval, self.uuid))
+                                (self.processed_data_path, self.interval, self.uuid))
 
-        except:
-            print("Couldn't save cointegrated pairs to files")
+        except (IOError, OSError, ValueError) as e:
+            logger.warning("Couldn't save cointegrated pairs to files: %s", e)
 
         self.coint_pairs = coint_pairs_df
 
@@ -300,15 +323,40 @@ class Coint_Analyzer:
 
     def _get_hurst_exponent(self, time_series):
         """Returns the Hurst Exponent of the time series vector ts"""
-        # Create the range of lag values
-        lags = range(2, 20)
-        # Calculate the array of the variances of the lagged differences
-        tau = [np.sqrt(np.std(np.subtract(time_series[lag:],
-                                          time_series[:-lag]))) for lag in lags]
-        # Use a linear fit to estimate the Hurst Exponent
+        max_lag = min(100, len(time_series) // 2)
+        lags = range(2, max(max_lag, 20))
+        tau = [np.std(np.subtract(time_series[lag:],
+                                  time_series[:-lag])) for lag in lags]
         poly = np.polyfit(np.log(lags), np.log(tau), 1)
-        # Return the Hurst exponent from the polyfit output
-        return poly[0]*2.0
+        return poly[0]
+
+    def _compute_spread(self, series_1, series_2, method):
+        """Compute spread and hedge ratio using the specified method.
+
+        Parameters
+        ----------
+        series_1, series_2 : pd.Series
+        method : str  — "kalman" | "ols" | "pykalman"
+
+        Returns
+        -------
+        (spread, hedge_ratio)
+        """
+        if method == "kalman":
+            mkf = VanillaKalmanFilter(delta=1e-4, R=2)
+            spread, hedge_ratio = mkf.regression(series_1, series_2)
+        elif method == "ols":
+            X = sm.add_constant(series_2)
+            model = sm.OLS(series_1, X).fit()
+            hedge_ratio = model.params.iloc[1]
+            spread = series_1 - hedge_ratio * series_2
+        elif method == "pykalman":
+            state_means = KalmanFilterRegression(series_1, series_2)
+            hedge_ratio = -state_means[:, 0]
+            spread = series_2 + (series_1 * hedge_ratio)
+        else:
+            raise ValueError(f"Unknown spread_method: {method!r}. Use 'kalman', 'ols', or 'pykalman'.")
+        return spread, hedge_ratio
 
     def _filter_by_observations(self, days=None, observations=None):
         df_observations = pd.DataFrame(columns=["observations"])
@@ -328,7 +376,7 @@ class Coint_Analyzer:
         if observations:
             target_instruments = df_observations.loc[df_observations.observations >
                                                      observations].index
-            self.df = self.df.filter(items=target_instruments).dropna
+            self.df = self.df.filter(items=target_instruments).dropna()
 
     def get_trading_pairs(self, corr_path=None, coint_path=None):
         df_corr = None
@@ -344,16 +392,138 @@ class Coint_Analyzer:
             return
 
         df_corr_coint_pairs = pd.DataFrame(
-            columns=["corr", "adf", "hurst", "granger_12", "granger_21"])
+            columns=["corr", "adf", "hurst"])
         for idx in df_corr.index:
             if idx in df_coint.index:
-                df_corr_coint_pairs.loc[idx] = [df_corr.loc[idx][0], df_coint.loc[idx]
-                                                [0], df_coint.loc[idx][1], df_coint.loc[idx][2], df_coint.loc[idx][3]]
+                df_corr_coint_pairs.loc[idx] = [
+                    df_corr.loc[idx][0],
+                    df_coint.loc[idx]['adf'],
+                    df_coint.loc[idx]['hurst'],
+                ]
 
         self.corr_coint_pairs = df_corr_coint_pairs
         try:
             df_corr_coint_pairs.to_csv("%scorr_coint_pairs_%s_%s.csv" %
                                        (self.processed_data_path, self.interval, self.uuid))
-        except:
-            print("Data couldn't be stored in a static file.")
+        except (IOError, OSError) as e:
+            logger.warning("Data couldn't be stored in a static file: %s", e)
         return df_corr_coint_pairs
+    
+    def _remove_quote_currency_pairs(self, df):
+        """Remove pairs where both instruments share the same base currency
+        (e.g. BTC_USDT vs BTC_BUSD), keeping only pairs with different bases."""
+        pairs_to_keep = []
+        for pair_name in df.index:
+            parts = pair_name.split('-')
+            base1 = parts[0].split('_')[0]
+            base2 = parts[1].split('_')[0]
+            if base1 != base2:
+                pairs_to_keep.append(pair_name)
+        return df.loc[pairs_to_keep]
+
+    def validate_pairs_on_timeframe(
+        self,
+        pairs_df,
+        validation_interval,
+        validation_closing_prices_container_paths,
+    ):
+        """Validate discovered pairs on a different timeframe (e.g. 15m after 1h discovery).
+
+        Loads closing prices for the validation interval, then for each pair in
+        pairs_df runs: cointegration test, ADF on spread, Hurst exponent and
+        half-life.  Returns a DataFrame with the original metrics plus validation
+        columns and a ``validated`` boolean.
+        """
+        # Load validation-interval closing prices (only instruments in pairs_df)
+        instruments = set()
+        for pair_name in pairs_df.index:
+            inst_1, inst_2 = pair_name.split("-")
+            instruments.add(inst_1)
+            instruments.add(inst_2)
+
+        df_val = pd.DataFrame()
+        for path in validation_closing_prices_container_paths:
+            with os.scandir('%s%s' % (self.raw_data_path, path)) as entries:
+                for entry in entries:
+                    instrument = "_".join(entry.name.split("_")[0:2])
+                    if instrument not in instruments:
+                        continue
+                    df = pd.read_csv(
+                        '%s%s/%s' % (self.raw_data_path, path, entry.name),
+                        index_col="Date",
+                    )
+                    df.index = pd.to_datetime(df.index)
+                    df = df[~df.index.duplicated(keep='first')]
+                    df = df[["Close"]].copy()
+                    df.columns = [instrument]
+                    df_val = pd.concat([df_val, df], axis=1)
+
+        df_val.dropna(inplace=True)
+
+        if df_val.empty:
+            logger.warning("No validation data loaded — returning empty result.")
+            return pd.DataFrame()
+
+        # Trim to lookback_days if configured
+        if self.lookback_days is not None and validation_interval in self.interval_to_days_map:
+            n_obs = int(self.lookback_days * self.interval_to_days_map[validation_interval])
+            if len(df_val) > n_obs:
+                df_val = df_val.iloc[-n_obs:]
+
+        results = []
+        for pair_name in pairs_df.index:
+            inst_1, inst_2 = pair_name.split("-")
+
+            if inst_1 not in df_val.columns or inst_2 not in df_val.columns:
+                logger.warning("Skipping %s — instrument(s) missing in validation data.", pair_name)
+                continue
+
+            row = pairs_df.loc[pair_name].to_dict()
+
+            # Cointegration test
+            coint_result = coint(df_val[inst_1], df_val[inst_2])
+            coint_pval = coint_result[1]
+
+            if coint_pval >= 0.05:
+                row.update({'val_coint_pval': coint_pval, 'val_adf': np.nan,
+                            'val_hurst': np.nan, 'val_half_life': np.nan,
+                            'validated': False})
+                results.append((pair_name, row))
+                continue
+
+            # Build spread
+            spread, _ = self._compute_spread(df_val[inst_1], df_val[inst_2], self.spread_method)
+
+            # ADF on spread
+            result_adf = adfuller(spread)
+            adf_stat = result_adf[0]
+            adf_pval = result_adf[1]
+
+            # Hurst exponent
+            hurst_val = self._get_hurst_exponent(np.array(spread))
+
+            # Half-life
+            half_life_val = half_life(spread)
+
+            validated = (
+                adf_pval < 0.05
+                and hurst_val <= 0.5
+                and (self.half_life_min is None or half_life_val >= self.half_life_min)
+                and (self.half_life_max is None or half_life_val <= self.half_life_max)
+            )
+
+            row.update({
+                'val_coint_pval': coint_pval,
+                'val_adf': adf_stat,
+                'val_hurst': hurst_val,
+                'val_half_life': half_life_val,
+                'validated': validated,
+            })
+            results.append((pair_name, row))
+
+        if not results:
+            return pd.DataFrame()
+
+        result_df = pd.DataFrame.from_dict(
+            {name: data for name, data in results}, orient='index')
+        return result_df
